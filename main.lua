@@ -26,46 +26,84 @@ function M:seek(job)
 	end
 end
 
+local function tmp_base()
+	if ya.target_family() == "windows" then
+		return os.getenv("TEMP") or os.getenv("TMP") or "."
+	end
+	return os.getenv("TMPDIR") or "/tmp"
+end
+
 function M:doc2pdf(job)
-	local tmp = "/tmp/yazi-" .. ya.uid() .. "/" .. ya.hash("office.yazi") .. "/"
+	local st = fs.cha(job.file.url)
+	if not st then
+		return nil, Err("Failed to stat `%s`", tostring(job.file.url))
+	end
 
-	--[[	For Future Reference: Regarding `libreoffice` as preconverter
-	  1. It prints errors to stdout (always, doesn't matter if it succeeded or it failed)
-	  2. Always writes the converted files to the filesystem, so no "Mario|Bros|Piping|Magic" for the data stream (https://ask.libreoffice.org/t/using-convert-to-output-to-stdout/38753)
-	  3. The `pdf:draw_pdf_Export` filter needs literal double quotes when defining its options (https://help.libreoffice.org/latest/en-US/text/shared/guide/pdf_params.html?&DbPAR=SHARED&System=UNIX#generaltext/shared/guide/pdf_params.xhp)
-	  3.1 Regarding double quotes and Lua strings, see https://www.lua.org/manual/5.1/manual.html#2.1 --]]
-	local libreoffice = Command("libreoffice")
-		:arg({
-			"--headless",
-			"--convert-to",
-			'pdf:draw_pdf_Export:{"PageRange":{"type":"string","value":"' .. job.skip + 1 .. '"}}',
-			"--outdir",
-			tmp,
-			tostring(job.file.url),
-		})
-		:stdin(Command.NULL)
-		:stdout(Command.PIPED)
-		:stderr(Command.PIPED)
-		:output()
+	-- Deterministic cache key so we can reuse conversions
+	local key_src = table.concat({
+		"office.yazi",
+		tostring(job.file.url),
+		tostring(st.mtime or ""),
+		tostring(st.len or ""),
+		tostring(job.skip + 1),
+	}, "|")
 
-	if not libreoffice.status.success then
-		local output = libreoffice.stdout .. libreoffice.stderr
-		local version = (output:match("LibreOffice .+") or ""):gsub("%\n.*", "")
-		local error = (output:match("Error:? .+") or ""):gsub("%\n.*", "")
-		if version ~= "" or error ~= "" then
-			ya.err((version or "LibreOffice") .. " " .. (error or "Unknown error"))
+	local key = ya.hash(key_src)
+	local tmp = tmp_base() .. "/yazi-office/" .. key .. "/"
+
+	local ok, err = fs.create("dir_all", Url(tmp))
+	if not ok then
+		return nil, Err("Failed to create temp dir %s: %s", tmp, err)
+	end
+
+	local pdf = tmp .. job.file.name:gsub("%.[^%.]+$", (".p" .. tostring(job.skip + 1) .. ".pdf"))
+
+	-- If already converted, reuse it
+	local f = io.open(pdf, "rb")
+	if f then
+		f:close()
+		return pdf
+	end
+
+	local args = {
+		"--headless",
+		"--convert-to",
+		('pdf:draw_pdf_Export:{"PageRange":{"type":"string","value":"%d"}}'):format(job.skip + 1),
+		"--outdir",
+		tmp,
+		tostring(job.file.url),
+	}
+
+	local out = Command("soffice")
+			:arg(args)
+			:stdin(Command.NULL)
+			:stdout(Command.PIPED)
+			:stderr(Command.PIPED)
+			:output()
+
+	if not out then
+		return nil, Err("Failed to start `soffice` (even though it works in PowerShell). Check PATH visibility for Yazi.")
+	end
+
+	if not out.status.success then
+		local output = (out.stdout or "") .. (out.stderr or "")
+		return nil, Err("soffice failed converting `%s`: %s", job.file.name, output)
+	end
+
+	-- LibreOffice outputs <originalname>.pdf, rename to include page number so pages don't collide
+	local produced = tmp .. job.file.name:gsub("%.[^%.]+$", ".pdf")
+	local ok_mv, mv_err = fs.rename(Url(produced), Url(pdf))
+	if not ok_mv then
+		-- If rename fails (sometimes output already correct), just try reading produced
+		local fp = io.open(produced, "rb")
+		if fp then
+			fp:close()
+			return produced
 		end
-		return nil, Err("Failed to preconvert `%s` to a temporary PDF", job.file.name)
+		return nil, Err("Failed to finalize PDF. rename error: %s", mv_err)
 	end
 
-	local tmp = tmp .. job.file.name:gsub("%.[^%.]+$", ".pdf")
-	local read_permission = io.open(tmp, "r")
-	if not read_permission then
-		return nil, Err("Failed to read `%s`: make sure file exists and have read access", tmp)
-	end
-	read_permission:close()
-
-	return tmp
+	return pdf
 end
 
 function M:preload(job)
@@ -80,18 +118,18 @@ function M:preload(job)
 	end
 
 	local output, err = Command("pdftoppm")
-		:arg({
-			"-singlefile",
-			"-jpeg",
-			"-jpegopt",
-			"quality=" .. rt.preview.image_quality,
-			"-f",
-			1,
-			tostring(tmp_pdf),
-		})
-		:stdout(Command.PIPED)
-		:stderr(Command.PIPED)
-		:output()
+			:arg({
+				"-singlefile",
+				"-jpeg",
+				"-jpegopt",
+				"quality=" .. rt.preview.image_quality,
+				"-f",
+				1,
+				tostring(tmp_pdf),
+			})
+			:stdout(Command.PIPED)
+			:stderr(Command.PIPED)
+			:output()
 
 	local rm_tmp_pdf, rm_err = fs.remove("file", Url(tmp_pdf))
 	if not rm_tmp_pdf then
