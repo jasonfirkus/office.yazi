@@ -16,7 +16,7 @@
 > 
 > To install it with `ya` run:
 > ```sh
-> ya pkg add jasonfirkus/office.yazi
+> ya pkg add jasonfirkus/office
 > ```
 
 ## Usage
